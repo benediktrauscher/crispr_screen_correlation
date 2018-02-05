@@ -115,7 +115,7 @@ corplots <- map(c('Pearson', 'Spearman'), function(m){
   
   ## histogram
   cor_df %>% filter(method==m) %>% 
-    ggplot(aes(value)) + geom_histogram(bins=40) + 
+    ggplot(aes(value)) + geom_histogram(bins=25) + 
     xlab(paste(m, 'correlation')) + 
     annotate('text', x=0, y=Inf, 
              label=paste('mean:', cor_mean, '\nmedian:', cor_median),
@@ -189,7 +189,7 @@ norm_count_cor <- dropout %>% map(norm_pairwise_cor)
 I visualize the results as histograms similar to above. 
 
 ```{r, results='hide', warning=F, message=F, fig.cap = "Replicate correlation of pooled CRISPR dropout screens based on normalized read counts"}
-norm_cor_df <- bind_rows(raw_count_cor)
+norm_cor_df <- bind_rows(norm_count_cor)
 
 ## generate plot for each method
 norm_corplots <- map(c('Pearson', 'Spearman'), function(m){
@@ -201,7 +201,7 @@ norm_corplots <- map(c('Pearson', 'Spearman'), function(m){
   
   ## histogram
   norm_cor_df %>% filter(method==m) %>% 
-    ggplot(aes(value)) + geom_histogram(bins=40) + 
+    ggplot(aes(value)) + geom_histogram(bins=25) + 
     xlab(paste(m, 'correlation')) + 
     annotate('text', x=0, y=Inf, 
              label=paste('mean:', cor_mean, '\nmedian:', cor_median),
@@ -212,7 +212,7 @@ norm_corplots <- map(c('Pearson', 'Spearman'), function(m){
 norm_corplots[[1]] + norm_corplots[[2]]
 ```
 
-The resulting correlation coefficients are very high and fairly comparable to those based on raw read counts. Count normalization might even lead to slightly higher correlations (Figure 2).
+The resulting correlation coefficients are similar to those based on raw read counts (Figure 2).
 
 # Replicate correlation of fold changes
 
