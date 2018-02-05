@@ -1,0 +1,318 @@
+---
+title: "Reproducibility in pooled CRISPR dropout screens"
+author: "Benedikt Rauscher"
+date: "2/4/2018"
+output: BiocStyle::html_document
+editor_options: 
+  chunk_output_type: console
+vignette: >
+  %\VignetteIndexEntry{Reproducibility in pooled CRISPR dropout screens}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Dependencies
+
+```{r, results='hide', warning=F, message=F}
+library(tidyverse)
+library(cowplot)
+library(reshape2)
+library(patchwork)
+library(edgeR)
+```
+
+# Analysis
+
+This analysis compares replicate correlation in pooled CRISPR Cas-9 dropout (negative selection for viability) screens. It aims to demonstrate how replicate correlation behaves across different levels of processing and to provide reference numbers to help judge future experiments.
+
+# Data preparation
+
+The analysis is based on the GenomeCRISPR database export (available for download [here](http://genomecrispr.dkfz.de/#!/download)), which I load in the next step.
+
+```{r, results='hide', warning=F, message=F}
+gcr <- read_csv('data/GenomeCRISPR_full05112017.csv.gz')
+```
+
+I select fields relevant for the analysis, which include the sgRNA sequence, target gene symbol, raw read counts as well as the PubMed ID, cell line and phenotype uniquely idenfying each experiment. I exclude screens where raw read count data are not available.
+
+```{r, results='hide', warning=F, message=F}
+gcr <- gcr %>% dplyr::select(symbol, sequence, pubmed, cellline,
+                             condition, rc_initial, rc_final) %>%
+  filter(rc_final != '[]')
+```
+
+I select only dropout screens (identified by a 'viability' phenotype) and disentangle read count fields, creating one column for each sample. I exclude experiments where only one replicate is reported at T~final~ (sequencing after selection).
+
+```{r, results='hide', warning=F, message=F}
+dropout <- gcr %>% filter(grepl('viability', condition)) %>% 
+  filter(pubmed != '999999') %>%
+  ## unite sgRNA and experiment columns
+  unite(sgRNA, symbol, sequence, sep='_') %>% 
+  unite(experiment, pubmed, cellline, condition, sep='_') %>%
+  mutate_at(vars(rc_initial, rc_final), ~ gsub('\\[|\\]', '', .)) %>%
+  ## list with one element per experiment
+  split(.$experiment)
+
+## disentangle count columns
+disentangle_cols <- function(df){
+  ## number of replicates
+  n_init <- str_count(df$rc_initial[1], ',') + 1
+  n_final <- str_count(df$rc_final[1], ',') + 1
+  
+  ## separate replicates
+  df <- df %>% 
+    separate(rc_initial, paste('initial', 1:n_init, sep='_'), sep=',') %>% 
+    separate(rc_final, paste('final', 1:n_final, sep='_'), sep=',')
+  
+  return(df)
+}
+
+## iterate over screens, disentangle columns
+dropout <- dropout %>% map(disentangle_cols)
+
+## remove screens with only one replicate reported
+dropout <- dropout[unlist(map(dropout, ~ 'final_2' %in% colnames(.)))]
+```
+
+# Replicate correlation of raw read counts
+
+For each experiment I calculate all pairwise Pearson and Spearman correlation coefficients between T~final~ samples. 
+
+```{r, results='hide', warning=F, message=F}
+calc_pairwise_cor <- function(df){
+  counts <- df %>% dplyr::select(contains('final')) %>% 
+    as.matrix() %>% apply(2, 'as.integer') 
+  
+  ## Pearson correlation
+  pcc <- cor(counts, method='pearson')
+  pcc[upper.tri(pcc)] <- NA
+  ## Spearman correlation
+  scc <- cor(counts, method='spearman')
+  scc[upper.tri(scc)] <- NA
+  
+  melt(pcc) %>% filter(Var1 != Var2) %>% drop_na() %>%
+    mutate(method='Pearson') %>% 
+    bind_rows(melt(scc) %>% filter(Var1 != Var2) %>% 
+                drop_na() %>% mutate(method='Spearman'))
+}
+
+## apply above function to each experiment
+raw_count_cor <- dropout %>% map(calc_pairwise_cor)
+```
+
+I visualize the resulting correlation coefficients as histograms.
+
+```{r, results='hide', warning=F, message=F, fig.cap = "Replicate correlation of pooled CRISPR dropout screens based on raw (unnormalized) read counts"}
+cor_df <- bind_rows(raw_count_cor)
+
+## generate plot for each method
+corplots <- map(c('Pearson', 'Spearman'), function(m){
+  ## mean and median
+  cor_mean <- cor_df %>% filter(method == m) %>% 
+    .$value %>% mean() %>% round(2)
+  cor_median <- cor_df %>% filter(method == m) %>% 
+    .$value %>% median() %>% round(2)
+  
+  ## histogram
+  cor_df %>% filter(method==m) %>% 
+    ggplot(aes(value)) + geom_histogram(bins=40) + 
+    xlab(paste(m, 'correlation')) + 
+    annotate('text', x=0, y=Inf, 
+             label=paste('mean:', cor_mean, '\nmedian:', cor_median),
+             hjust=0, vjust=1) + 
+    xlim(c(0,1))
+})
+
+corplots[[1]] + corplots[[2]]
+```
+
+Replicate correlations based on raw read counts tend to almost always be very high, often coming close to 1 (Figure 1). There are some outliers. A closer look reveals that in some cases one of 3 or 4 replicates does not match the other replicates (details are not shown here). There are not cases where only two poorly correlating replicates are available. Such experiments might not have met the authors' quality criteria and might therefore not have been published.
+
+To show some examples, I also draw scatter plots for four randomly selected examples.
+
+```{r, results='hide', warning=F, message=F}
+cor_scatter <- function(df, title=''){
+  data <- df %>% dplyr::select(`replicate 1` = final_1, 
+                               `replicate 2` = final_2) %>%
+    mutate_all('as.integer') 
+  
+  ## correlation coefficients
+  pcc <- cor(data[,1], data[,2], method='pearson') %>% round(2)
+  scc <- cor(data[,1], data[,2], method='spearman') %>% round(2)
+  
+  data %>% ggplot(aes(x=`replicate 1`, y=`replicate 2`)) +
+    geom_hex(bins=100) + geom_abline(linetype = 'dashed') + 
+    annotate('text', x=0, y=Inf, vjust=1, hjust=0,
+             label = paste('PCC:', pcc, '\nSCC:', scc)) + 
+    ggtitle(title)
+}
+
+## draw four random examples
+set.seed(12345)
+sample_exp <- sample(dropout, 4)
+scatter_plots <- map2(sample_exp, names(sample_exp),
+                      function(x,y) cor_scatter(x, title=''))
+
+## visualize
+reduce(scatter_plots, `+`)
+```
+
+# Replicate correlation of normalized read counts
+
+I repeat the same steps as above but I normalize the read counts before calculating the correlation coefficients. I use `edgeR`'s TMM normalization.
+
+```{r, results='hide', warning=F, message=F}
+norm_pairwise_cor <- function(df){
+  counts <- df %>% dplyr::select(contains('final')) %>% 
+    as.matrix() %>% apply(2, 'as.integer') %>%
+    .[,!apply(., 2, function(x)sum(is.na(x)) == length(x))] %>%
+    ## TMM normalization
+    DGEList() %>% calcNormFactors() %>% cpm(log=F)
+  
+  ## Pearson correlation
+  pcc <- cor(counts, method='pearson')
+  pcc[upper.tri(pcc)] <- NA
+  ## Spearman correlation
+  scc <- cor(counts, method='spearman')
+  scc[upper.tri(scc)] <- NA
+  
+  melt(pcc) %>% filter(Var1 != Var2) %>% drop_na() %>%
+    mutate(method='Pearson') %>% 
+    bind_rows(melt(scc) %>% filter(Var1 != Var2) %>% 
+                drop_na() %>% mutate(method='Spearman'))
+}
+
+## apply above function to each experiment
+norm_count_cor <- dropout %>% map(norm_pairwise_cor)
+```
+
+I visualize the results as histograms similar to above. 
+
+```{r, results='hide', warning=F, message=F, fig.cap = "Replicate correlation of pooled CRISPR dropout screens based on normalized read counts"}
+norm_cor_df <- bind_rows(raw_count_cor)
+
+## generate plot for each method
+norm_corplots <- map(c('Pearson', 'Spearman'), function(m){
+  ## mean and median
+  cor_mean <- norm_cor_df %>% filter(method == m) %>% 
+    .$value %>% mean() %>% round(2)
+  cor_median <- norm_cor_df %>% filter(method == m) %>% 
+    .$value %>% median() %>% round(2)
+  
+  ## histogram
+  norm_cor_df %>% filter(method==m) %>% 
+    ggplot(aes(value)) + geom_histogram(bins=40) + 
+    xlab(paste(m, 'correlation')) + 
+    annotate('text', x=0, y=Inf, 
+             label=paste('mean:', cor_mean, '\nmedian:', cor_median),
+             hjust=0, vjust=1) + 
+    xlim(c(0,1))
+})
+
+norm_corplots[[1]] + norm_corplots[[2]]
+```
+
+The resulting correlation coefficients are very high and fairly comparable to those based on raw read counts. Count normalization might even lead to slightly higher correlations (Figure 2).
+
+# Replicate correlation of fold changes
+
+In cases where two replicates exist for T~0~ (these are the minority) I just use replicate 1 for simplicity. I then calculate the log~2~ fold change for each T~final~ replicate after count normalization by `edgeR` TMM normalization. I exclude sgRNAs that are underrepresented at T~0~ (less than 30 counts).
+
+```{r, results='hide', warning=F, message=F}
+calc_fold_changes <- function(df){
+  ## normalize counts
+  counts <- df %>% dplyr::select(initial_1, contains('final')) %>%  
+    filter(initial_1 >= 30) %>%
+    as.matrix() %>% apply(2, 'as.integer') %>%
+    .[,!apply(., 2, function(x)sum(is.na(x)) == length(x))] %>%
+    ## TMM normalization
+    DGEList() %>% calcNormFactors() %>% cpm(log=T)
+  
+  ## fold changes
+  fc <- counts[,2:ncol(counts)] - counts[,1]
+  
+  return(fc)
+}
+
+calc_fc_correlation <- function(fc){
+  ## Pearson correlation
+  pcc <- cor(fc, method='pearson')
+  pcc[upper.tri(pcc)] <- NA
+  ## Spearman correlation
+  scc <- cor(fc, method='spearman')
+  scc[upper.tri(scc)] <- NA
+  
+  melt(pcc) %>% filter(Var1 != Var2) %>% drop_na() %>%
+    mutate(method='Pearson') %>% 
+    bind_rows(melt(scc) %>% filter(Var1 != Var2) %>% 
+                drop_na() %>% mutate(method='Spearman'))
+}
+
+## apply above function to each experiment
+screen_fc <- dropout %>% map(calc_fold_changes)
+fc_cor <- screen_fc %>% map(calc_fc_correlation)
+```
+
+As before I visualize the resulting correlation coefficients as histograms.
+
+```{r, results='hide', warning=F, message=F, fig.cap = "Replicate correlation of pooled CRISPR dropout screens based on log2 fold changes"}
+cor_fc <- bind_rows(fc_cor)
+
+## generate plot for each method
+corplots_fc <- map(c('Pearson', 'Spearman'), function(m){
+  ## mean and median
+  cor_mean <- cor_fc %>% filter(method == m) %>% 
+    .$value %>% mean() %>% round(2)
+  cor_median <- cor_fc %>% filter(method == m) %>% 
+    .$value %>% median() %>% round(2)
+  
+  ## histogram
+  cor_fc %>% filter(method==m) %>% 
+    ggplot(aes(value)) + geom_histogram(bins=25) + 
+    xlab(paste(m, 'correlation')) + 
+    annotate('text', x=0, y=Inf, 
+             label=paste('mean:', cor_mean, '\nmedian:', cor_median),
+             hjust=0, vjust=1) + 
+    xlim(c(0,1))
+})
+
+corplots_fc[[1]] + corplots_fc[[2]]
+```
+
+Figure 3 shows that correlation coefficients are considerable worse when calculated on log~2~ fold changes averaging at `r cor_fc %>% filter(method == 'Pearson') %>% .$value %>% mean() %>% round(2)`.
+
+To show some examples, I also draw scatter plots for some randomly selected experiments.
+
+```{r, results='hide', warning=F, message=F}
+cor_scatter_fc <- function(df, title=''){
+  data <- tbl_df(df[,1:2]) %>% 
+    dplyr::select(`replicate 1`=final_1, `replicate 2` = final_2)
+  
+  ## correlation coefficients
+  pcc <- cor(data[[1]], data[[2]], method='pearson') %>% round(2)
+  scc <- cor(data[[1]], data[[2]], method='spearman') %>% round(2)
+  
+  data %>% ggplot(aes(x=`replicate 1`, y=`replicate 2`)) +
+    geom_hex(bins=100) + geom_abline(linetype = 'dashed') +
+    geom_vline(xintercept=0, linetype = 'dashed') + 
+    geom_hline(yintercept=0, linetype = 'dashed') +
+    annotate('text', x=-Inf, y=Inf, vjust=1, hjust= -0.1,
+             label = paste('PCC:', pcc, '\nSCC:', scc)) + 
+    ggtitle(title)
+}
+
+## draw four random examples
+set.seed(12345)
+sample_exp <- sample(screen_fc, 4)
+scatter_plots <- map2(sample_exp, names(sample_exp),
+                      function(x,y) cor_scatter_fc(x, title=''))
+
+## visualize
+reduce(scatter_plots, `+`)
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
